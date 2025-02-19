@@ -1,0 +1,238 @@
+import torch  
+import triton  
+import triton.language as tl  
+  
+class NativeSparseAttention(torch.nn.Module):  
+    def __init__(self, d_model=512, n_heads=8, comp_block=32, sel_block=64, win_size=512):  
+        super().__init__()  
+        self.d_model = d_model  
+        self.n_heads = n_heads  
+        self.comp_block = comp_block  # 压缩块大小  
+        self.sel_block = sel_block    # 选择块大小  
+        self.win_size = win_size      # 滑动窗口大小  
+          
+        # 压缩模块的MLP（公式3）  
+        self.comp_mlp = torch.nn.Sequential(  
+            torch.nn.Linear(comp_block*d_model, d_model//2),  
+            torch.nn.GELU(),  
+            torch.nn.Linear(d_model//2, d_model)  
+        )  
+          
+        # 门控网络（公式5中的g_c^t）  
+        self.gate_net = torch.nn.Linear(d_model, 3)  # 三分支权重  
+  
+    def forward(self, Q, K, V):  
+        """ 
+        Q/K/V形状: (batch, seq_len, d_model) 
+        """  
+        batch_size, seq_len, _ = Q.shape  
+          
+        # === 1. Token Compression ===  
+        # 将K/V分割为块并压缩（公式3）  
+        compressed_K = self._compress_kv(K, self.comp_block)  
+        compressed_V = self._compress_kv(V, self.comp_block)  
+          
+        # === 2. Token Selection ===  
+        # 计算压缩后的注意力分数（公式4）  
+        comp_attn = self._comp_attn(Q, compressed_K)  
+          
+        # 选择Top-N块（公式6-7）  
+        selected_K, selected_V = self._select_blocks(K, V, comp_attn)  
+          
+        # === 3. Sliding Window ===  
+        # 提取局部窗口（论文3.3.3节）  
+        window_K = K[:, -self.win_size:, :]  
+        window_V = V[:, -self.win_size:, :]  
+          
+        # === 多分支注意力计算 ===  
+        # 各分支独立计算注意力  
+        attn_comp = self._sparse_attn(Q, compressed_K, compressed_V)  
+        attn_sel = self._sparse_attn(Q, selected_K, selected_V)  
+        attn_win = self._sparse_attn(Q, window_K, window_V)  
+          
+        # 门控融合（公式5）  
+        gates = torch.softmax(self.gate_net(Q), dim=-1)  # (B, T, 3)  
+        output = (gates[…] * attn_comp +   
+                 gates[…] * attn_sel +   
+                 gates[…] * attn_win)  
+        return output  
+  
+    def _compress_kv(self, x, block_size):  
+        """ 
+        块压缩函数（公式3） 
+        x: (B, T, D) 
+        返回: (B, T//block_size, D) 
+        """  
+        B, T, D = x.shape  
+        # 填充序列长度到block_size整数倍  
+        pad_len = (block_size - T % block_size) % block_size  
+        x = torch.nn.functional.pad(x, (0,0,0,pad_len))  
+          
+        # 分割块并压缩  
+        x_blocks = x.view(B, -1, block_size, D)  # (B, num_blocks, block, D)  
+        x_comp = self.comp_mlp(x_blocks.flatten(2))  # (B, num_blocks, D)  
+        return x_comp  
+ 
+    @triton.jit  
+    def _comp_attn_kernel(  
+        Q_ptr, K_ptr, output_ptr,  
+        seq_len, d_model,  
+        BLOCK_SIZE: tl.constexpr,  
+        **meta  
+    ):  
+        # Triton内核：计算压缩注意力分数（公式4）  
+        pid = tl.program_id(0)  
+        off_q = pid * seq_len  
+        off_k = pid * (seq_len // meta['comp_block'])  
+          
+        # 使用Tensor Core加速矩阵乘  
+        acc = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)  
+        for i in range(0, d_model, BLOCK_SIZE):  
+            q = tl.load(Q_ptr + off_q + i, mask=(i + BLOCK_SIZE) <= d_model)  
+            k = tl.load(K_ptr + off_k + i, mask=(i + BLOCK_SIZE) <= d_model)  
+            acc += tl.dot(q, k)  
+          
+        # 存储结果  
+        tl.store(output_ptr + pid, acc.to(tl.float16))  
+  
+    def _comp_attn(self, Q, K):  
+        """ 
+        压缩注意力分数计算（公式4） 
+        Q: (B, T, D) 
+        K: (B, T//block, D) 
+        返回: (B, T, T//block) 
+        """  
+        B, T, D = Q.shape  
+        comp_T = K.shape[1]  
+        output = torch.empty((B*self.n_heads, T, comp_T), device=Q.device)  
+          
+        # 调用Triton内核  
+        grid = lambda meta: (B*self.n_heads,)  
+        self._comp_attn_kernel[grid](  
+            Q, K, output,  
+            seq_len=T, d_model=D,  
+            BLOCK_SIZE=64  # 根据GPU架构调整  
+        )  
+        return output.view(B, self.n_heads, T, comp_T)  
+  
+    def _select_blocks(self, K, V, comp_attn):  
+        """ 
+        根据压缩注意力分数选择Top-N块（公式6-7） 
+        K/V: (B, T, D) 
+        comp_attn: (B, heads, T, T_comp) 
+        返回: (B, T_selected, D), (B, T_selected, D) 
+        """  
+        B, heads, T, T_comp = comp_attn.shape  
+        block_size = self.sel_block  
+          
+        # --- 计算块重要性分数 ---  
+        # 压缩注意力分数按头求平均（公式4扩展）  
+        block_scores = comp_attn.mean(dim=1)  # (B, T, T_comp)  
+        # 转换为块级分数（假设comp_block与sel_block对齐）  
+        block_scores = block_scores.view(B, T, -1, self.comp_block//self.sel_block)  
+        block_scores = block_scores.max(dim=-1).values  # (B, T, num_blocks)  
+          
+        # --- 选择Top-N块 ---  
+        topk_scores, topk_indices = torch.topk(  
+            block_scores.flatten(-2),   
+            k=self.n_selected_blocks,  # 根据论文设置n=16  
+            dim=-1  
+        )  # (B, T, n)  
+          
+        # --- 收集选中的KV块 ---  
+        selected_K = self._gather_blocks(K, topk_indices, block_size)  
+        selected_V = self._gather_blocks(V, topk_indices, block_size)  
+        return selected_K, selected_V  
+  
+    def _gather_blocks(self, x, indices, block_size):  
+        """ 
+        根据块索引收集对应的块数据 
+        x: (B, T, D) 
+        indices: (B, T, n) 
+        返回: (B, T, n*block_size, D) 
+        """  
+        B, T, D = x.shape  
+        x_blocks = x.view(B, -1, block_size, D)  # (B, num_blocks, block, D)  
+          
+        # 扩展索引以匹配块维度  
+        expanded_indices = indices.unsqueeze(-1).expand(-1, -1, -1, block_size, D)  
+        selected = x_blocks.gather(1, expanded_indices)  # (B, T, n, block, D)  
+        return selected.view(B, T, -1, D)  # 合并块维度  
+ 
+    @triton.jit  
+    def _sparse_attn_kernel(  
+        Q_ptr, K_ptr, V_ptr, Out_ptr,  
+        stride_qb, stride_qh, stride_qt, stride_qd,  
+        stride_kb, stride_kh, stride_kt, stride_kd,  
+        stride_vb, stride_vh, stride_vt, stride_vd,  
+        seq_len, d_model, win_size,  
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,  
+        **kwargs  
+    ):  
+        # Triton内核：稀疏注意力计算（公式5的实现）  
+        pid = tl.program_id(0)  
+        batch_head = pid // seq_len  
+        token_idx = pid % seq_len  
+          
+        # 初始化累加器  
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)  
+          
+        # 加载当前Query块  
+        off_q = batch_head * stride_qh + token_idx * stride_qt  
+        q = tl.load(Q_ptr + off_q + tl.arange(0, BLOCK_M)[:, None] * stride_qd)  
+          
+        # 遍历Key块（压缩、选择、窗口分支合并处理）  
+        for i in range(0, win_size, BLOCK_N):  
+            # 加载Key块  
+            k = tl.load(K_ptr + i * stride_kt + tl.arange(0, BLOCK_N)[None, :] * stride_kd)  
+            # 计算QK^T  
+            qk = tl.dot(q, k, allow_tf32=True)  
+            # 应用局部掩码（因果注意力）  
+            mask = (i + tl.arange(0, BLOCK_N)) <= token_idx  
+            qk = qk * mask  
+            # 累加  
+            acc += qk  
+          
+        # Softmax归一化  
+        max_val = tl.max(acc, axis=1)  
+        acc = acc - max_val[:, None]  
+        acc = tl.exp(acc)  
+        sum_val = tl.sum(acc, axis=1)  
+        acc = acc / sum_val[:, None]  
+          
+        # 乘Value矩阵  
+        out = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)  
+        for i in range(0, win_size, BLOCK_N):  
+            v = tl.load(V_ptr + i * stride_vt + tl.arange(0, BLOCK_N)[None, :] * stride_vd)  
+            out += acc[:, i:i+BLOCK_N] * v  
+          
+        # 存储结果  
+        tl.store(Out_ptr + pid * (BLOCK_M * BLOCK_N), out.to(tl.float16))  
+  
+    def _sparse_attn(self, Q, K, V):  
+        """ 
+        稀疏注意力计算（整合压缩、选择和窗口分支） 
+        Q: (B, T, D) 
+        K/V: (B, T_selected, D) 
+        返回: (B, T, D) 
+        """  
+        B, T, D = Q.shape  
+        T_selected = K.shape[1]  
+          
+        # 调整维度为多头形式  
+        Q = Q.view(B, T, self.n_heads, -1).permute(0,2,1,3)  # (B, h, T, d_k)  
+        K = K.view(B, T_selected, self.n_heads, -1).permute(0,2,1,3)  
+        V = V.view(B, T_selected, self.n_heads, -1).permute(0,2,1,3)  
+          
+        # 调用Triton内核  
+        output = torch.empty_like(Q)  
+        grid = lambda meta: (B * self.n_heads * T,)  
+        self._sparse_attn_kernel[grid](  
+            Q, K, V, output,  
+            Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),  
+            K.stride(0), K.stride(1), K.stride(2), K.stride(3),  
+            V.stride(0), V.stride(1), V.stride(2), V.stride(3),  
+            seq_len=T, d_model=D//self.n_heads, win_size=T_selected,  
+            BLOCK_M=64, BLOCK_N=64  # 根据GPU架构调整  
+        )  
+        return output.permute(0,2,1,3).contiguous().view(B, T, D)  
